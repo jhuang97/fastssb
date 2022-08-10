@@ -10,9 +10,9 @@ from argparse import ArgumentParser
 import os
 from pathlib import Path
 
-from . import data4d as d4
-from .optics import wavelength, get_qx_qy_1D, disk_overlap_function, single_sideband_reconstruction
-from . import plotting
+from fastssb import data4d as d4
+from fastssb.optics import wavelength, get_qx_qy_1D, disk_overlap_function, single_sideband_reconstruction
+from fastssb import plotting
 
 import tifffile
 
@@ -195,6 +195,8 @@ def main():
     mask[:,-1] = 0
     mask[:,0] = 0
     mask[:,1] = 0
+
+    # might want to save mask as numpy array
 
     gg = Gabs.get()
     gg[~mask] = gg.mean()

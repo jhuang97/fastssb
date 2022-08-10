@@ -2,6 +2,7 @@ import math
 import numpy as np
 import cupy as cp
 import torch as th
+import sys
 
 from ncempy.io.dm import fileDM
 from .optics import wavelength
@@ -74,6 +75,8 @@ class Sparse4DData:
             frame_indices = np.arange(scan_dimensions[0] * scan_dimensions[1])
             frame_indices = np.reshape(frame_indices, scan_dimensions)
             s1, s2 = start_idx
+            if s1 < 0 or s2 < 0 or s1+n_pos >= scan_dimensions[0] or s2+n_pos >= scan_dimensions[1]:
+                sys.exit(f'Crop indices {start_idx}, {n_pos} incompatible with scan dimensions {scan_dimensions}')
             frame_indices = frame_indices[s1:s1+n_pos, s2:s2+n_pos].flatten()
             print(np.reshape(frame_indices, (n_pos, n_pos)))
             frames_crop = frames.ravel()[frame_indices]
@@ -87,12 +90,10 @@ class Sparse4DData:
             return fr_full_4d 
 
         d = Sparse4DData()
-        print('attempting to load data')
         if start_idx is not None and n_pos is not None:
             d.indices = cp.ascontiguousarray(make_unragged_frames_cropped(frames.ravel(), scan_dimensions, start_idx, n_pos))
         else:
             d.indices = cp.ascontiguousarray(make_unragged_frames(frames.ravel(), scan_dimensions))
-        print('d.indices: ', d.indices.shape)
         d.scan_dimensions = np.array(d.indices.shape[:2])
         d.frame_dimensions = frame_dimensions
         d.counts = cp.zeros(d.indices.shape, dtype=cp.bool)
