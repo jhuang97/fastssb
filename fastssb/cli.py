@@ -58,16 +58,59 @@ def plot_virtual_images(d, metadata, radius, scan_number):
     plt.tight_layout()
 
 
+def get_scan_path(directory, scan_num, scan_id=None, th=None):
+    """ Get the file path for a 4D Camaera scan number with 
+    the option of adding the Distiller scan id or the threshold. If scn_id and th
+    are entered then th is ignored.
+    
+    Parameters
+    ----------
+    directory : pathlib.Path or str
+        The path to the directory containing the file.
+    scan_num : int
+        The 4D Camera scan number
+    scan_id : int, optional
+        The Distiller scan if. Optional
+    th : float, optional
+        The threshold for counting. This is added to the filename in some cases.
+        
+    Returns
+    -------
+    : pathlib.Path
+        The file that matches the input information.
+    """
+    if scan_num:
+        if scan_id:
+            file_path = directory / Path('data_scan{}_id{}_electrons.h5'.format(scan_num, scan_id))
+        if th:
+            file_path = directory / Path('data_scan{}_th{}_electrons.h5'.format(scan_num, th))
+        else:
+            file_paths = list(directory.glob('data_scan{}*electrons.h5'.format(scan_num, th)))
+            if len(file_paths) > 1:
+                raise ValueError('Multiple files match that input. Add scan_id to be more specific.')
+            else:
+                file_path = file_paths[0]
+    else:
+        raise TypeError('Missing scan_num input.')
+    
+    return file_path
+
+
+
 def main():
     parser = ArgumentParser(prog='fastssb')
     parser.add_argument(
-        'sparse_file', 
+        '-s', '--sparse_file', 
         type=Path,
         help='Input sparse 4D STEM data set')
     parser.add_argument(
-        'adf_file', 
+        '-a', '--adf_file', 
         type=Path,
         help='ADF file containing metadata')
+    parser.add_argument(
+        '-n', '--scan_num',
+        type=int, default=0,
+        help="scan number")
     parser.add_argument(
         "--out_dir",
         type=Path,
@@ -76,8 +119,8 @@ def main():
     )
     args = parser.parse_args()
 
-    # data_dir = 'C:\\Jeffrey\\Code\\fastssb_dev\\realtime_ptycho_example_data'
-    scan_number = 147
+    # data_dir = 'something'
+    scan_number = args.scan_num
 
     # base_path = Path(data_dir)
     # adfpath = base_path

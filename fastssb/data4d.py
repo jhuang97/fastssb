@@ -59,12 +59,12 @@ class Sparse4DData:
             unragged_frame_size = unragged_frames_size(frames.ravel())
             print('scan dimensions:', scan_dimensions)
             print('frames size: ', len(frames.ravel()), frames[0].shape)
-            fr_full = cp.zeros((frames.ravel().shape[0], unragged_frame_size), dtype=cp.int32)
-            fr_full[:] = cp.iinfo(fr_full.dtype).max
+            fr_full = np.zeros((frames.ravel().shape[0], unragged_frame_size), dtype=np.int32)
+            fr_full[:] = np.iinfo(fr_full.dtype).max
             print('filling fr_full array')
             for ii, ev in enumerate(frames.ravel()):
-                fr_full[ii, :ev.shape[0]] = cp.array(ev)
-            fr_full_4d = fr_full.reshape((*scan_dimensions, fr_full.shape[1]))
+                fr_full[ii, :ev.shape[0]] = ev
+            fr_full_4d = cp.asarray(fr_full.reshape((*scan_dimensions, fr_full.shape[1])))
             print('fr_full: ', fr_full.shape, 'fr_full_4d: ', fr_full_4d.shape)
 
             fr_full_4d = fr_full_4d[:, :-1, :]
@@ -81,12 +81,12 @@ class Sparse4DData:
             print(np.reshape(frame_indices, (n_pos, n_pos)))
             frames_crop = frames.ravel()[frame_indices]
             unragged_frame_size = unragged_frames_size(frames_crop)
-            fr_full = cp.zeros((frames_crop.ravel().shape[0], unragged_frame_size), dtype=cp.int32)
-            fr_full[:] = cp.iinfo(fr_full.dtype).max
+            fr_full = np.zeros((frames_crop.ravel().shape[0], unragged_frame_size), dtype=np.int32)
+            fr_full[:] = np.iinfo(fr_full.dtype).max
             print('filling fr_full array')
             for ii, ev in enumerate(frames_crop.ravel()):
-                fr_full[ii, :ev.shape[0]] = cp.array(ev)
-            fr_full_4d = fr_full.reshape((n_pos, n_pos, fr_full.shape[1]))
+                fr_full[ii, :ev.shape[0]] = ev
+            fr_full_4d = cp.asarray(fr_full.reshape((n_pos, n_pos, fr_full.shape[1])))
             return fr_full_4d 
 
         d = Sparse4DData()
