@@ -1,0 +1,15 @@
+{
+    "argv": [
+        "{resource_dir}/kernel-helper.sh",
+        "/global/homes/u/user/.conda/envs/fastssb/bin/python",
+        "-m",
+        "ipykernel_launcher",
+        "-f",
+        "{connection_file}"
+    ],
+    "display_name": "fastssb",
+    "language": "python",
+    "metadata": {
+        "debugger": true
+    }
+}
