@@ -2,7 +2,6 @@ import math
 import cmath as cm
 import numpy as np
 import cupy as cp
-import torch as th
 from numba import cuda
 
 def wavelength(E_eV):
@@ -26,6 +25,28 @@ def DOF(alpha, E_eV):
     return DOF
 
 
+def Q_freq_to_d_spacing(qx, qy):
+    '''convert these Q_p frequencies into something more human-readable'''
+    ds = 1/np.sqrt(qx**2 + qy**2)
+    angles = np.arctan2(qy, qx) * 180 / np.pi
+    return ds, angles
+
+
+def d_spacing_to_Q_freq(ds, angles):
+    q = 1/ds
+    angle_rad = angles * np.pi / 180
+    qx = q * np.cos(angle_rad)
+    qy = q * np.sin(angle_rad)
+    return qx, qy
+
+
+def repr_d_spacings(ds, angles):
+    out = ''
+    for d, angle in zip(ds, angles):
+        out += f'({d:.3f} Å, {angle:.1f}°) '
+    return out
+
+
 def get_qx_qy_1D(M, dx, dtype, fft_shifted=False):
     qxa = cp.fft.fftfreq(M[0], dx[0]).astype(dtype)
     qya = cp.fft.fftfreq(M[1], dx[1]).astype(dtype)
@@ -43,23 +64,6 @@ def get_qx_qy_2D(M, dx, dtype, fft_shifted=False):
         qxn = cp.fft.fftshift(qxn)
         qyn = cp.fft.fftshift(qyn)
     return qxn, qyn
-
-def get_qx_qy_1D_th(M, dx, dtype, fft_shifted=False):
-    qxa = np.fft.fftfreq(M[0], dx[0]).astype(dtype)
-    qya = np.fft.fftfreq(M[1], dx[1]).astype(dtype)
-    if fft_shifted:
-        qxa = np.fft.fftshift(qxa)
-        qya = np.fft.fftshift(qya)
-    return th.as_tensor(np.stack([qxa, qya]))
-
-def get_qx_qy_2D_th(M, dx, dtype, fft_shifted=False):
-    qxa = np.fft.fftfreq(M[0], dx[0]).astype(dtype)
-    qya = np.fft.fftfreq(M[1], dx[1]).astype(dtype)
-    [qxn, qyn] = np.meshgrid(qxa, qya)
-    if fft_shifted:
-        qxn = np.fft.fftshift(qxn)
-        qyn = np.fft.fftshift(qyn)
-    return th.as_tensor(np.stack([qxn, qyn]))
 
 
 def disk_overlap_function(Qx_all, Qy_all, Kx_all, Ky_all, aberrations, theta_rot, alpha, lam):

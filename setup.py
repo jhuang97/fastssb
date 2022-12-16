@@ -23,17 +23,17 @@ setup(
     # Versions should comply with PEP440.  For a discussion on single-sourcing
     # the version across setup.py and the project code, see
     # https://packaging.python.org/en/latest/single_source_version.html
-    version='0.0.1',
+    version='0.1.0',
 
-    description='realtime-ptychography Python Package',
-    long_description='long_description',
+    description='fast single sideband ptychography',
+    long_description='fastssb - refactored version of the realtime-ptychography code by Philipp Pelz',
 
     # The project's main homepage.
-    url='https://github.com/PhilippPelz/realtime_ptychography',
+    url='https://github.com/jhuang97/fastssb',
 
     # Author details
-    author='P. Pelz',
-    author_email='philipp.pelz@berkeley.edu',
+    author='Jeffrey Huang',
+    author_email='jhuan100@illinois.edu',
 
     # Choose your license
     license='GPLv3+, MIT',
@@ -55,7 +55,6 @@ setup(
 
         # Specify the Python versions you support here. In particular, ensure
         # that you indicate whether you support Python 2, Python 3 or both.
-        'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
     ],
@@ -75,7 +74,7 @@ setup(
     # your project is installed. For an analysis of "install_requires" vs pip's
     # requirements files see:
     # https://packaging.python.org/en/latest/requirements.html
-    install_requires=['numpy', 'matplotlib', 'h5py', 'ncempy', 'numba<=0.55.2', 'scikit-image', 'matplotlib-scalebar', 'tifffile'],
+    install_requires=['numpy', 'matplotlib', 'h5py', 'ncempy', 'numba>=0.55.2,!=0.56.0', 'scikit-image', 'matplotlib-scalebar', 'tifffile'],
 
     # Before installing fastssb, CUDA must be installed.
 
@@ -86,9 +85,6 @@ setup(
     # alternatively,
     # $ pip install cupy
     # will install from source. This may take a long time.
-
-    # also recommend installing pytorch manually in order to install the one for the right CUDA version, for example
-    # $ pip3 install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
 
 
     # List additional groups of dependencies here (e.g. development
@@ -107,7 +103,7 @@ setup(
     # To provide executable scripts, use entry points in preference to the
     # "scripts" keyword. Entry points provide cross-platform support and allow
     # pip to create the appropriate form of executable for the target platform.
-    entry_points={
-        'console_scripts': ['fastssb = fastssb.cli:main'],
-    },
+    # entry_points={
+    #     'console_scripts': ['fastssb = fastssb.cli:main'],
+    # },
 )

@@ -1,15 +1,21 @@
 import math
 import numpy as np
 import cupy as cp
-import torch as th
-import sys
-
+import cupyx
+import cupyx.scipy.fft as cpfft
+import cupyx.scipy.ndimage
+import scipy
+import scipy.fft as spfft
+import scipy.ndimage
+import matplotlib.pyplot as plt
 from ncempy.io.dm import fileDM
+import h5py
 from .optics import wavelength
 
-from skimage.filters import gaussian
 from numba import jit, cuda
-import h5py
+
+import time
+
 
 class Metadata4D:
     def __init__(self):
@@ -32,323 +38,44 @@ class Metadata4D:
         return m
 
 
-class Sparse4DData:
-
+class MetadataEMPAD:
     def __init__(self):
-        self.indices = None
-        self.counts = None
-        self.scan_dimensions = None
-        self.frame_dimensions = None
+        self.dr = None
+        self.alpha_rad = None
+        self.rotation_deg = None
+        self.E_ev = None
+        self.wavelength = None
+        self.nominal_mag = None
 
-    @staticmethod
-    def from_4Dcamera_file(filename, start_idx=None, n_pos=None):
-        with h5py.File(filename, 'r') as f0:
-            frames = f0['electron_events/frames'][:]
-            scan_dimensions = (f0['electron_events/scan_positions'].attrs['Ny'],
-                               f0['electron_events/scan_positions'].attrs['Nx'])
-            frame_dimensions = np.array((576, 576))
 
-        def unragged_frames_size(frames):
-            mm = 0
-            for ev in frames:
-                if ev.shape[0] > mm:
-                    mm = ev.shape[0]
-            return mm
+def locate_BF_disk(pacbed, threshold=0.1, fix_4Dcam=False):
+    from skimage.filters import gaussian
+    pacbed_blur = (gaussian(pacbed.astype(np.float32),2) > pacbed.max() * threshold).astype(float)
+    
+    # the 4D camera has several half-rows of dead pixels - try to mitigate that
+    if fix_4Dcam:
+        dead_y = [183, 184, 185, 387, 388, 389]
+        dead_xlims = [288, 576]
+        intensity_guess = np.linspace(1.0, 0.0, dead_xlims[1] - dead_xlims[0])
+        for dead_y_val in dead_y:
+            pacbed_blur[dead_y, dead_xlims[0]:dead_xlims[1]] = intensity_guess
 
-        def make_unragged_frames(frames, scan_dimensions):
-            unragged_frame_size = unragged_frames_size(frames.ravel())
-            print('scan dimensions:', scan_dimensions)
-            print('frames size: ', len(frames.ravel()), frames[0].shape)
-            fr_full = np.zeros((frames.ravel().shape[0], unragged_frame_size), dtype=np.int32)
-            fr_full[:] = np.iinfo(fr_full.dtype).max
-            print('filling fr_full array')
-            for ii, ev in enumerate(frames.ravel()):
-                fr_full[ii, :ev.shape[0]] = ev
-            fr_full_4d = cp.asarray(fr_full.reshape((*scan_dimensions, fr_full.shape[1])))
-            print('fr_full: ', fr_full.shape, 'fr_full_4d: ', fr_full_4d.shape)
+    radius, center_y, center_x = get_probe_size(pacbed_blur)
+    print(f'radius: {radius:.2f} px, center: (x,y) = ({center_x:.2f}, {center_y:.2f})')
 
-            fr_full_4d = fr_full_4d[:, :-1, :]
-            print('fr_full_4d: ', fr_full_4d.shape)
-            return fr_full_4d
+    fig,ax = plt.subplots()
+    im = ax.imshow(pacbed)
+    cb = fig.colorbar(im, ax=ax)
+    ax.plot(center_x, center_y, 'g.')
 
-        def make_unragged_frames_cropped(frames, scan_dimensions, start_idx, n_pos):
-            frame_indices = np.arange(scan_dimensions[0] * scan_dimensions[1])
-            frame_indices = np.reshape(frame_indices, scan_dimensions)
-            s1, s2 = start_idx
-            if s1 < 0 or s2 < 0 or s1+n_pos >= scan_dimensions[0] or s2+n_pos >= scan_dimensions[1]:
-                sys.exit(f'Crop indices {start_idx}, {n_pos} incompatible with scan dimensions {scan_dimensions}')
-            frame_indices = frame_indices[s1:s1+n_pos, s2:s2+n_pos].flatten()
-            print(np.reshape(frame_indices, (n_pos, n_pos)))
-            frames_crop = frames.ravel()[frame_indices]
-            unragged_frame_size = unragged_frames_size(frames_crop)
-            fr_full = np.zeros((frames_crop.ravel().shape[0], unragged_frame_size), dtype=np.int32)
-            fr_full[:] = np.iinfo(fr_full.dtype).max
-            print('filling fr_full array')
-            for ii, ev in enumerate(frames_crop.ravel()):
-                fr_full[ii, :ev.shape[0]] = ev
-            fr_full_4d = cp.asarray(fr_full.reshape((n_pos, n_pos, fr_full.shape[1])))
-            return fr_full_4d 
+    angles = np.linspace(0, 2*np.pi, 18)
+    xcirc = center_x + radius * np.cos(angles)
+    ycirc = center_y + radius * np.sin(angles)
+    ax.plot(xcirc, ycirc, 'ro')
 
-        d = Sparse4DData()
-        if start_idx is not None and n_pos is not None:
-            d.indices = cp.ascontiguousarray(make_unragged_frames_cropped(frames.ravel(), scan_dimensions, start_idx, n_pos))
-        else:
-            d.indices = cp.ascontiguousarray(make_unragged_frames(frames.ravel(), scan_dimensions))
-        d.scan_dimensions = np.array(d.indices.shape[:2])
-        d.frame_dimensions = frame_dimensions
-        d.counts = cp.zeros(d.indices.shape, dtype=cp.bool)
-        d.counts[d.indices != cp.iinfo(d.indices.dtype).max] = 1
-
-        return d
-
-    def crop_symmetric_center_(self, center, max_radius = None):
-        if max_radius is None:
-            y_min_radius = np.min([center[0], self.frame_dimensions[0] - center[0]])
-            x_min_radius = np.min([center[1], self.frame_dimensions[1] - center[1]])
-            max_radius = np.min([y_min_radius, x_min_radius])
-        new_frames, new_frame_dimensions = crop_symmetric_around_center(self.indices,
-                                                                        self.frame_dimensions,
-                                                                        center, max_radius)
-        print(f'old frames frame_dimensions: {self.frame_dimensions}')
-        print(f'new frames frame_dimensions: {new_frame_dimensions}')
-        self.indices = new_frames
-        self.counts = cp.zeros(self.indices.shape, dtype=cp.bool)
-        self.counts[self.indices != cp.iinfo(self.indices.dtype).max] = 1
-        self.frame_dimensions = new_frame_dimensions
-
-    def crop_symmetric_center(self, center, max_radius = None):
-        if max_radius is None:
-            y_min_radius = np.min([center[0], self.frame_dimensions[0] - center[0]])
-            x_min_radius = np.min([center[1], self.frame_dimensions[1] - center[1]])
-            max_radius = np.min([y_min_radius, x_min_radius])
-        new_frames, new_frame_dimensions = crop_symmetric_around_center(cp.array(self.indices),
-                                                                        cp.array(self.frame_dimensions),
-                                                                        center, max_radius)
-        print(f'old frames frame_dimensions: {self.frame_dimensions}')
-        print(f'new frames frame_dimensions: {new_frame_dimensions}')
-        res = Sparse4DData()
-        res.indices = new_frames
-        res.counts = cp.zeros(self.indices.shape, dtype=cp.bool)
-        res.counts[self.indices != cp.iinfo(self.indices.dtype).max] = 1
-        res.frame_dimensions = new_frame_dimensions
-        res.scan_dimensions = self.scan_dimensions.copy()
-        return res
-
-    def rotate_(self, angle_rad, center=None):
-        if center is None:
-            center = self.frame_dimensions // 2
-        new_indices = rotate(self.indices, self.frame_dimensions, center, angle_rad)
-        self.indices = new_indices
-
-    def rotate(self, angle_rad, center=None):
-        if center is None:
-            center = self.frame_dimensions // 2
-        new_indices = rotate(self.indices, self.frame_dimensions, center, angle_rad)
-        res = Sparse4DData()
-        res.indices = new_indices
-        res.counts = self.counts.copy()
-        res.frame_dimensions = self.frame_dimensions
-        res.scan_dimensions = self.scan_dimensions.copy()
-        return res
-
-    def sum_diffraction(self):
-        res = sum_frames(self.indices, self.counts, self.frame_dimensions)
-        return res
-
-    @staticmethod
-    def _determine_center_and_radius(data , manual=False, size=25):
-        sh = np.concatenate([data.scan_dimensions,data.frame_dimensions])
-        c = np.zeros((2,))
-        c[:] = (sh[-1] // 2, sh[-2] // 2)
-        c = cp.array(c)
-        radius = cp.ones((1,)) * sh[-1] // 2
-        inds = cp.array(data.indices[:size, :size].astype(cp.uint32))
-        cts = cp.array(data.counts[:size, :size].astype(cp.uint32))
-        dc_subset = sparse_to_dense_datacube_crop(inds,cts, (size,size), data.frame_dimensions, c, radius, bin=2)
-        dcs = cp.sum(dc_subset, (0, 1))
-        m1 = dcs.get()
-        m = (gaussian(m1.astype(cp.float32),2) > m1.max() * 3e-1).astype(cp.float)
-        r, y0, x0 = get_probe_size(m)
-        return 2 * np.array([y0,x0]), r*2
-
-    def determine_center_and_radius(self, manual=False, size=25):
-        return Sparse4DData._determine_center_and_radius(self, manual, size=size)
-
-    def to_dense(self, bin_factor):
-        dense = sparse_to_dense_datacube_crop_gain_mask(self.indices, self.counts.astype(cp.int16), self.scan_dimensions,
-                                                self.frame_dimensions, self.frame_dimensions/2, self.frame_dimensions[0]/2,
-                                                self.frame_dimensions[0]/2, binning=bin_factor, fftshift=False)
-        return dense
-
-    @staticmethod
-    def from_dense(dense, make_float = False):
-        res = Sparse4DData()
-        res.frame_dimensions = np.array(dense.shape[-2:])
-        res.scan_dimensions = np.array(dense.shape[:2])
-
-        inds = np.prod(res.frame_dimensions)
-        if inds > 2**31:
-            dtype = cp.int64
-        elif inds > 2**15:
-            dtype = cp.int32
-        elif inds > 2**8:
-            dtype = cp.int16
-        else:
-            dtype = cp.uint8
-
-        nonzeros = cp.sum((dense > 0),(2,3))
-        nonzeros = cp.max(nonzeros)
-
-        bits_counts = np.log2(dense.max())
-        if make_float:
-            dtype_counts = cp.float32
-        else:
-            if bits_counts > np.log2(2**31-1):
-                dtype_counts = cp.int64
-            elif bits_counts > np.log2(2**15-1):
-                dtype_counts = cp.int32
-            elif bits_counts > 8:
-                dtype_counts = cp.int16
-            else:
-                dtype_counts = cp.uint8
-
-        threadsperblock = (16, 16)
-        blockspergrid = tuple(np.ceil(res.scan_dimensions / threadsperblock).astype(np.int))
-        dense = cp.array(dense)
-        indices = cp.zeros((*dense.shape[:2], nonzeros), dtype=dtype)
-        indices[:] = cp.iinfo(dtype).max
-        counts = cp.zeros((*dense.shape[:2], nonzeros), dtype=dtype_counts)
-        dense_to_sparse_kernel[blockspergrid, threadsperblock](dense, indices, counts, cp.array(res.frame_dimensions))
-
-        res.indices = indices.get()
-        res.counts = counts.get()
-
-        print(f'frame_dimensions: {res.frame_dimensions}')
-        print(f'scan_dimensions : {res.scan_dimensions}')
-        print(f'Using dtype: {dtype} for indices')
-        print(f'Using dtype: {dtype_counts} for counts')
-        return res
-
-    @staticmethod
-    def rebin(sparse_data, bin_factor : int):
-        dense = sparse_to_dense_datacube_crop_gain_mask(sparse_data.indices, sparse_data.counts.astype(cp.int16), sparse_data.scan_dimensions,
-                                                sparse_data.frame_dimensions, sparse_data.frame_dimensions/2, sparse_data.frame_dimensions[0]/2,
-                                                sparse_data.frame_dimensions[0]/2, binning=bin_factor, fftshift=False)
-        sparse = Sparse4DData.from_dense(dense)
-        return sparse
-
-    @staticmethod
-    def fftshift(sparse_data):
-        indices = sparse_data.indices
-        scan_dimensions = sparse_data.scan_dimensions
-        frame_dimensions = sparse_data.frame_dimensions
-        center_frame = frame_dimensions / 2
-        radius_data = frame_dimensions[0] / 2
-
-        threadsperblock = (16, 16)
-        blockspergrid = tuple(np.ceil(np.array(indices.shape[:2]) / threadsperblock).astype(np.int))
-
-        no_count_indicator = np.iinfo(indices.dtype).max
-        inds = cp.array(indices)
-        fftshift_kernel[blockspergrid, threadsperblock](inds, center_frame, scan_dimensions, no_count_indicator)
-        sparse_data.indices = inds.get()
-        return sparse_data
-
-    @staticmethod
-    def fftshift_and_pad_to(sparse_data, pad_to_frame_dimensions):
-        indices = sparse_data.indices
-        scan_dimensions = sparse_data.scan_dimensions
-        frame_dimensions = sparse_data.frame_dimensions
-        center_frame = frame_dimensions / 2
-
-        threadsperblock = (16, 16)
-        blockspergrid = tuple(np.ceil(np.array(indices.shape[:2]) / threadsperblock).astype(np.int))
-
-        no_count_indicator_old = np.iinfo(indices.dtype).max
-
-        inds = np.prod(pad_to_frame_dimensions)
-        if inds > 2**15:
-            dtype = cp.int64
-        elif inds > 2**15:
-            dtype = cp.int32
-        elif inds > 2**8:
-            dtype = cp.int16
-        else:
-            dtype = cp.uint8
-
-        no_count_indicator_new = cp.iinfo(dtype).max
-
-        inds = cp.array(indices, dtype=dtype)
-        fftshift_pad_kernel[blockspergrid, threadsperblock](inds, center_frame, scan_dimensions,
-                                                            cp.array(pad_to_frame_dimensions), no_count_indicator_old,
-                                                            no_count_indicator_new)
-        sparse_data.indices = inds.get()
-        sparse_data.frame_dimensions = np.array(pad_to_frame_dimensions)
-        return sparse_data
-
-    def fftshift_(self):
-        return Sparse4DData.fftshift(self)
-
-    def fftshift_and_pad_to_(self, pad_to_frame_dimensions):
-        return Sparse4DData.fftshift_and_pad_to(self, pad_to_frame_dimensions)
-
-    def bin(self, binning_factor):
-        res = Sparse4DData.rebin(self, binning_factor)
-        return res
-
-    def virtual_annular_image(self, inner_radius, outer_radius, center):
-        img = cp.zeros(tuple(self.scan_dimensions), dtype=np.uint32)
-        no_count_indicator = np.iinfo(self.indices.dtype).max
-        threadsperblock = (16, 16)
-        blockspergrid = tuple(np.ceil(np.array(self.indices.shape[:2]) / threadsperblock).astype(np.int))
-        virtual_annular_image_kernel[blockspergrid, threadsperblock](img, cp.array(self.indices), cp.array(self.counts.astype(np.uint32)),
-                                                                     inner_radius, outer_radius, cp.array(center),
-                                                                     cp.array(self.frame_dimensions), no_count_indicator)
-        return img.get()
-
-    def fluence(self, dr):
-        sum_electrons = self.counts.sum()
-        area = np.prod(self.scan_dimensions) * dr**2
-        return sum_electrons/area
-
-    def flux(self, dr, dwell_time):
-        fluence = self.fluence(dr)
-        flux = fluence / (np.prod(self.scan_dimensions) * dwell_time)
-        return flux
-
-    def slice(self, slice):
-        res = Sparse4DData()
-        res.indices = cp.ascontiguousarray(self.indices[slice])
-        res.counts = cp.ascontiguousarray(self.counts[slice])
-        res.scan_dimensions = np.array(res.counts.shape[:2])
-        res.frame_dimensions = self.frame_dimensions.copy()
-        return res
-
-    def center_of_mass(self):
-        qx, qy = np.meshgrid(np.arange(self.scan_dimensions[0]),np.arange(self.scan_dimensions[1]))
-        comx = cp.zeros(self.scan_dimensions, dtype=cp.float32)
-        comy = cp.zeros(self.scan_dimensions, dtype=cp.float32)
-
-        no_count_indicator = np.iinfo(self.indices.dtype).max
-
-        mass = cp.sum(self.counts,2)
-
-        threadsperblock = (16, 16)
-        blockspergrid = tuple(np.ceil(np.array(self.indices.shape[:2]) / threadsperblock).astype(np.int))
-
-        qx = cp.array(qx).astype(cp.float32)
-        qy = cp.array(qy).astype(cp.float32)
-        center_of_mass_kernel[blockspergrid, threadsperblock](comx, comy, self.indices, self.counts.astype(cp.uint32),
-                                                              cp.array(self.frame_dimensions), no_count_indicator, qx, qy)
-        comy = comy
-        comx = comx
-        comx /= mass + 1e-6
-        comy /= mass + 1e-6
-        comy[comy==0] = cp.mean(comy[comy!=0])
-        comx[comx==0] = cp.mean(comx[comx!=0])
-        comx -= cp.mean(comx)
-        comy -= cp.mean(comy)
-        return comy, comx
+    plt.show()
+    
+    return radius, (center_y, center_x)
 
 
 def get_CoM(ar):
@@ -417,6 +144,26 @@ def get_probe_size(DP, thresh_lower=0.01, thresh_upper=0.99, N=100):
     return r, x0, y0
 
 
+def shift_and_crop(arr4d, radius, center, use_gpu=True):
+    frame_radius = int(math.ceil(radius)) + 1
+    center_y, center_x = center
+    yfrac, y_ic = math.modf(center_y)
+    xfrac, x_ic = math.modf(center_x)
+    y_ic, x_ic = int(y_ic), int(x_ic)
+    
+    margin = 1
+    precrop_r = frame_radius + margin
+    data_precrop = arr4d[:, :, y_ic-precrop_r:y_ic+precrop_r+1, x_ic-precrop_r:x_ic+precrop_r+1]
+    
+    if use_gpu:
+        data_shift = cupyx.scipy.ndimage.shift(cp.array(data_precrop), (0, 0, -yfrac, -xfrac))
+        data_crop = cp.ascontiguousarray(data_shift[:, :, margin:-margin, margin:-margin])
+    else:
+        data_shift = scipy.ndimage.shift(data_precrop, (0, 0, -yfrac, -xfrac))
+        data_crop = cp.array(data_shift[:, :, margin:-margin, margin:-margin])
+    return data_crop, frame_radius
+
+
 def sector_mask(shape, centre, radius, angle_range=(0,360)):
     """
     Return a boolean mask for a circular sector. The start/stop angles in
@@ -447,342 +194,236 @@ def sector_mask(shape, centre, radius, angle_range=(0,360)):
     return circmask * anglemask
 
 
+def load_sparse_4dcam_data(filename4d, crop_to_n=None, start_idx=(0,0)):
+    t1 = time.perf_counter()
+
+    with h5py.File(filename4d, 'r') as f0:
+        frames = f0['electron_events/frames'][:]
+        scan_dimensions = (f0['electron_events/scan_positions'].attrs['Ny'],
+                           f0['electron_events/scan_positions'].attrs['Nx'])
+        frame_dimensions = np.array((576, 576))
+
+    t2 = time.perf_counter()
+    print(f'Frames loaded: {t2-t1:.3f} s')
+
+    b_GB = 1073741824
+    b_MB = 1048576
+    max_frame_size = 0
+    frame_tot = 0
+    tot_counts = 0
+    print('collecting some statistics')
+    for ev in frames:
+        frame_tot += ev.nbytes
+        tot_counts += ev.shape[0]
+        if ev.shape[0] > max_frame_size:
+            max_frame_size = ev.shape[0]
+    print(f'Frames read: {frame_tot/b_GB:.3f} GB')
+
+    frame_indices = np.arange(scan_dimensions[0] * scan_dimensions[1])
+    frame_indices = np.reshape(frame_indices, scan_dimensions)
+
+    # scan_dimensions - there is an extra row that needs to be cropped out
+    frame_indices = frame_indices[:, :-1]
+    scan_dimensions = (scan_dimensions[0], scan_dimensions[1]-1)
+    
+    if crop_to_n is not None:
+        s0, s1 = start_idx
+        if s0 < 0 or s1 < 0 or s0+crop_to_n >= scan_dimensions[0] or s1+crop_to_n >= scan_dimensions[1]:
+            raise ValueError(f'Crop indices {start_idx}, {crop_to_n} incompatible with scan dimensions {scan_dimensions}')
+        frame_indices = frame_indices[s0:s0+crop_to_n, s1:s1+crop_to_n]
+        scan_dimensions = (crop_to_n, crop_to_n)
+        print(f'Cropped to {scan_dimensions} frames')
+
+    frames_crop = frames.ravel()[frame_indices.flatten()]
+    max_frame_size = 0
+    tot_counts_crop = 0
+    tot_image = np.zeros(scan_dimensions[0] * scan_dimensions[1])
+    for index, ev in enumerate(frames_crop.ravel()):
+        tot_counts_crop += ev.shape[0]
+        tot_image[index] = ev.shape[0]
+        if ev.shape[0] > max_frame_size:
+            max_frame_size = ev.shape[0]
+    tot_image = tot_image.reshape((scan_dimensions[0], scan_dimensions[1]))
+    print(f'Largest frame had {max_frame_size} electrons; total number of electrons: {tot_counts_crop}')
+
+    t2 = time.perf_counter()
+    print(f'Time elapsed: {t2-t1:.3f} s')
+    return frames_crop, scan_dimensions, frame_dimensions, max_frame_size, tot_counts_crop, tot_image
+
+
+def get_fluence(sum_electrons, scan_dimensions, dr):
+    area = np.prod(scan_dimensions) * dr**2
+    return sum_electrons/area
+
+
+def get_flux(sum_electrons, scan_dimensions, dr, dwell_time):
+    fluence = get_fluence(sum_electrons, scan_dimensions, dr)
+    flux = fluence / (np.prod(scan_dimensions) * dwell_time)
+    return flux
+
+
 @cuda.jit
-def center_of_mass_kernel(comx, comy, indices, counts, frame_dimensions, no_count_indicator, qx, qy):
-    ny, nx = cuda.grid(2)
-    NY, NX, _ = indices.shape
+def sparse_to_pacbed_kernel(indices1d, pacbed_gpu, frame_dimensions, start, end):
+    n = cuda.grid(1)
     MY, MX = frame_dimensions
-    if ny < NY and nx < NX:
-        for i in range(indices[ny, nx].shape[0]):
-            idx1d = indices[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            if idx1d != no_count_indicator:
-                cuda.atomic.add(comy, (ny, nx), counts[ny, nx, i] * qy[my, mx])
-                cuda.atomic.add(comx, (ny, nx), counts[ny, nx, i] * qx[my, mx])
+    if n >= start and n < end:
+        idx1d = indices1d[n]
+        my = idx1d // MX
+        mx = idx1d - my*MX
+        cuda.atomic.add(pacbed_gpu, (my, mx), 1)
+
+
+def calculate_pacbed_from_sparse(frames, frame_dimensions, tot_counts, arr_size_gpu=int(3e8)):
+    # 1D indices array (don't need to know scan positions for computing PACBED)
+    fr_1D = cupyx.zeros_pinned((tot_counts), dtype=np.int32)
+    idx = 0
+    for ev in frames.ravel():
+        idx_next = idx + ev.shape[0]
+        fr_1D[idx:idx_next] = ev
+        idx = idx_next
+
+    pacbed_gpu = cp.zeros(frame_dimensions, dtype=np.int32)
+        
+    if arr_size_gpu <= tot_counts:
+        fr_1D_gpu = cp.empty(arr_size_gpu, dtype=cp.int32)
+
+        nbatches = tot_counts // arr_size_gpu
+        nleft = tot_counts - nbatches * arr_size_gpu
+        threadsperblock = 256
+        blockspergrid = math.ceil(arr_size_gpu / threadsperblock)
+
+        for b_idx in range(nbatches):
+            offset = b_idx * arr_size_gpu
+            fr_1D_gpu.set(fr_1D[offset:offset+arr_size_gpu])
+            sparse_to_pacbed_kernel[blockspergrid, threadsperblock](fr_1D_gpu, pacbed_gpu, tuple(frame_dimensions), 0, arr_size_gpu)
+            cuda.synchronize()
+
+        if nleft > 0:
+            fr_1D_gpu.set(fr_1D[-arr_size_gpu:])
+            sparse_to_pacbed_kernel[blockspergrid, threadsperblock](fr_1D_gpu, pacbed_gpu, tuple(frame_dimensions), arr_size_gpu-nleft, arr_size_gpu)
+            cuda.synchronize()
+    else:
+        fr_1D_gpu = cp.array(fr_1D)
+        threadsperblock = 256
+        blockspergrid = math.ceil(tot_counts / threadsperblock)
+        sparse_to_pacbed_kernel[blockspergrid, threadsperblock](fr_1D_gpu, pacbed_gpu, tuple(frame_dimensions), 0, tot_counts)
+
+    return pacbed_gpu.get()
+
+
+# typically use this for 4D Camera data
+def crop_bin_single_CBED(frame_size, bin_factor, center, frame_dimensions, pacbed):
+    radius_max_bin_int = frame_size // 2
+    center_frame = frame_size // 2
+    max_dist_center = (radius_max_bin_int + 0.5 - 1e-3) * bin_factor
+    # print(radius_data_int, radius_max_int, radius_max, frame_size, max_dist_center)
+
+    pacbed_binned = np.zeros((frame_size, frame_size), dtype=np.int32)
+    pixels_in_bin = np.zeros((frame_size, frame_size), dtype=int)
+    center_y, center_x = center
+    for iy in range(frame_dimensions[0]):
+        for ix in range(frame_dimensions[1]):
+            my_center = iy - center_y
+            mx_center = ix - center_x
+            dist_center = math.sqrt(my_center**2 + mx_center**2)
+            if dist_center < max_dist_center:
+                mybin = center_frame + int(np.round(my_center/bin_factor))
+                mxbin = center_frame + int(np.round(mx_center/bin_factor))
+                pacbed_binned[mybin, mxbin] += pacbed[iy, ix]
+                pixels_in_bin[mybin, mxbin] += 1
+    return pacbed_binned, pixels_in_bin
 
 
 @cuda.jit
-def sparse_to_dense_datacube_kernel_crop(dc, indices, counts, frame_dimensions, bin, start, end, no_count_indicator):
-    ny, nx = cuda.grid(2)
-    NY, NX, MYBIN, MXBIN = dc.shape
-    MY, MX = frame_dimensions
-    if ny < NY and nx < NX:
-        for i in range(indices[ny, nx].shape[0]):
-            idx1d = indices[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            if my >= start[0] and mx >= start[1] and my < end[0] and mx < end[1]:
-                mybin = (my - start[0]) // bin
-                mxbin = (mx - start[1]) // bin
-                if idx1d != no_count_indicator:
-                    cuda.atomic.add(dc, (ny, nx, mybin, mxbin), counts[ny, nx, i])
+def sparse_to_dense_crop_bin_kernel(indices3d, max_frame_size, dc, 
+                                    idx_to_my, idx_to_mx, no_count_indicator, ny_offset, start, end):
+    iy, nx = cuda.grid(2)
+    NY, NX, _, _ = dc.shape
+    if iy >= start and iy < end and nx < NX:
+        ny = iy + ny_offset
+        if ny < NY:
+            i = 0
+            done = False
+            while i < max_frame_size and not done:
+                idx1d = indices3d[iy, nx, i]
+                if idx1d == no_count_indicator:
+                    done = True
+                elif idx_to_my[idx1d] >= 0:
+                    cuda.atomic.add(dc, (ny, nx, idx_to_my[idx1d], idx_to_mx[idx1d]), 1)
+                i += 1
 
 
-def sparse_to_dense_datacube_crop(indices, counts, scan_dimensions, frame_dimensions, center, radius, bin=1):
-    radius = int(np.ceil(radius / bin) * bin)
-    start = center - radius
-    end = center + radius
-    frame_size = 2 * radius // bin
+def crop_bin_sparse_to_dense(frames, frame_size, bin_factor, center, radius, frame_dimensions, scan_dimensions, max_frame_size, arr_size_gpu=int(3e8)):
+    t1 = time.perf_counter()
+    # figure out where every pixel of the detector should go, ahead of time
+    idx_range_1D = np.arange(frame_dimensions[0] * frame_dimensions[1])
+    my_range = idx_range_1D // frame_dimensions[1]
+    mx_range = idx_range_1D - my_range * frame_dimensions[1]
+    center_frame = frame_size // 2
+    radius_max_bin_int = frame_size // 2
+    max_dist_center = (radius_max_bin_int + 0.5 - 1e-3) * bin_factor
+    center_y, center_x = center
+    my_center_range = my_range - center_y
+    mx_center_range = mx_range - center_x
+    dist_center_range = np.sqrt(my_center_range**2 + mx_center_range**2)
+    mybin_range = (my_center_range/bin_factor).round().astype(int) + center_frame
+    mxbin_range = (mx_center_range/bin_factor).round().astype(int) + center_frame
+    replace_mask = dist_center_range >= max_dist_center
+    mybin_range[replace_mask] = -1
+    mxbin_range[replace_mask] = -1
+    mybin_range_gpu = cp.asarray(mybin_range)
+    mxbin_range_gpu = cp.asarray(mxbin_range)
+    
+    print('Converting frames to 3D array')
+    idx_t = np.int32
+    no_count_indicator = np.iinfo(idx_t).max
+    fr_full = cupyx.empty_pinned((frames.ravel().shape[0], max_frame_size), dtype=idx_t)
+    fr_full.fill(no_count_indicator)
+    for ii, ev in enumerate(frames.ravel()):
+        fr_full[ii, :ev.shape[0]] = ev
+    fr_full = fr_full.reshape((scan_dimensions[0], scan_dimensions[1], max_frame_size))
+    
+    print('Converting frames to dense 4D array')
+    dc_gpu = cp.zeros((scan_dimensions[0], scan_dimensions[1], frame_size, frame_size), dtype=np.int32)
+    if scan_dimensions[0] * scan_dimensions[1] * max_frame_size >= arr_size_gpu:
+        assert scan_dimensions[1] * max_frame_size <= arr_size_gpu
+        
+        # calculate batch sizes
+        batch_size_dim0 = arr_size_gpu // (scan_dimensions[1] * max_frame_size)
+        # batch_size_dim0 = batch_size_dim0 // 16 * 16
+        batch_size_dim0 = batch_size_dim0 // 32 * 32
 
-    xp = cp.get_array_module(indices)
-    print('attempting to allocate array: ', (*scan_dimensions, frame_size, frame_size), indices.dtype)
-    dc = cp.zeros((*scan_dimensions, frame_size, frame_size), dtype=indices.dtype)
+        nbatches = scan_dimensions[0] // batch_size_dim0
+        nleft = scan_dimensions[0] - nbatches * batch_size_dim0
 
-    threadsperblock = (16, 16)
-    blockspergrid = tuple(np.ceil(np.array(indices.shape[:2]) / threadsperblock).astype(np.int))
+        fr_full_gpu = cp.empty((batch_size_dim0, scan_dimensions[1], max_frame_size), dtype=idx_t)
 
-    no_count_indicator = np.iinfo(indices.dtype).max
+        threadsperblock = (32, 32)
+        blockspergrid = tuple(np.ceil(np.array(fr_full_gpu.shape[:2]) / threadsperblock).astype(int))
 
-    sparse_to_dense_datacube_kernel_crop[blockspergrid, threadsperblock](dc, indices, counts, cp.array(frame_dimensions), bin,
-                                                                         start, end, no_count_indicator)
-    return dc
+        # binning in batches using Numba
+        for b_idx in range(nbatches):
+            offset = b_idx * batch_size_dim0
+            fr_full_gpu.set(fr_full[offset:offset+batch_size_dim0])
+            sparse_to_dense_crop_bin_kernel[blockspergrid, threadsperblock](fr_full_gpu, max_frame_size, dc_gpu, 
+                                        mybin_range_gpu, mxbin_range_gpu, no_count_indicator, offset, 0, batch_size_dim0)
+            cuda.synchronize()
+            print('batch at offset:', offset)
 
-
-@cuda.jit
-def sparse_to_dense_datacube_crop_gain_mask_kernel(dc, frames, counts,
-                                                   frame_dimensions,
-                                                   center_frame, center_data,
-                                                   radius_data_int, binning,
-                                                   fftshift):
-    ny, nx = cuda.grid(2)
-    NY, NX, MYBIN, MXBIN = dc.shape
-    MY, MX = frame_dimensions
-    if ny < NY and nx < NX:
-        for i in range(frames[ny, nx].shape[0]):
-            idx1d = frames[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            my_center = my - center_data[0]
-            mx_center = mx - center_data[1]
-            dist_center = math.sqrt(my_center ** 2 + mx_center ** 2)
-            if dist_center < radius_data_int:
-                mybin = int(center_frame[0] + my_center // binning)
-                mxbin = int(center_frame[1] + mx_center // binning)
-                if fftshift:
-                    mybin = (mybin - center_frame[0]) % (center_frame[0] * 2)
-                    mxbin = (mxbin - center_frame[1]) % (center_frame[1] * 2)
-                if (mxbin >= 0 and mybin >= 0):
-                    cuda.atomic.add(dc, (ny, nx, mybin, mxbin), counts[ny, nx, i])
-
-
-def sparse_to_dense_datacube_crop_gain_mask(indices, counts, scan_dimensions, frame_dimensions, center_data, radius_data,
-                                            radius_max, binning=1, fftshift=False):
-    radius_data_int = int(np.ceil(radius_data / binning) * binning)
-    radius_max_int = int(np.ceil(radius_max / binning) * binning)
-    frame_size = 2 * radius_max_int // binning
-
-    print(f'radius_data_int : {radius_data_int} ')
-    print(f'radius_max_int  : {radius_max_int} ')
-    print(f'Dense frame size: {frame_size}x {frame_size}')
-
-    stream = th.cuda.current_stream().cuda_stream
-
-    dc0 = np.zeros((scan_dimensions[0],scan_dimensions[1], frame_size, frame_size), dtype=np.uint8)
-    dc = th.zeros((scan_dimensions[0]//2,scan_dimensions[1], frame_size, frame_size), dtype=th.float32)
-
-    center_frame = th.tensor([frame_size // 2, frame_size // 2])
-    fd = th.as_tensor(frame_dimensions)
-    center = th.as_tensor(center_data)
-    inds = th.as_tensor(indices[:scan_dimensions[0]//2,...])
-    cts = th.as_tensor(counts[:scan_dimensions[0]//2,...].astype(np.float32), dtype=th.float32)
-
-    threadsperblock = (16, 16)
-    blockspergrid = tuple(np.ceil(np.array(indices.shape[:2]) / threadsperblock).astype(np.int))
-    print('sparse_to_dense_datacube_crop_gain_mask dtypes:',dc.dtype, inds.dtype, cts.dtype, frame_dimensions.dtype)
-
-    sparse_to_dense_datacube_crop_gain_mask_kernel[blockspergrid, threadsperblock, stream](dc, inds, cts, fd,
-                                                                                   center_frame, center,
-                                                                                   radius_data_int, binning,
-                                                                                   fftshift)
-
-    dc0[:scan_dimensions[0]//2,...] = dc.cpu().type(th.uint8).numpy()
-
-    dc[:] = 0
-    inds = th.as_tensor(indices[scan_dimensions[0]//2:,...])
-    cts = th.as_tensor(counts[scan_dimensions[0]//2:,...].astype(np.float32), dtype=th.float32)
-
-    sparse_to_dense_datacube_crop_gain_mask_kernel[blockspergrid, threadsperblock, stream](dc, inds, cts, fd,
-                                                                                   center_frame, center,
-                                                                                   radius_data_int, binning,
-                                                                                   fftshift)
-    dc0[scan_dimensions[0]//2:,...] = dc.cpu().type(th.uint8).numpy()
-    cuda.select_device(0)
-    return dc0
-
-
-def sparse_to_dense_datacube(indices, counts, scan_dimensions, frame_dimensions, center_data, radius_data,
-                                            radius_max, binning=1, fftshift=False):
-    radius_data_int = int(np.ceil(radius_data / binning) * binning)
-    radius_max_int = int(np.ceil(radius_max / binning) * binning)
-    frame_size = 2 * radius_max_int // binning
-
-    print(f'radius_data_int : {radius_data_int} ')
-    print(f'radius_max_int  : {radius_max_int} ')
-    print(f'dense frame size: {frame_size}x {frame_size}')
-
-    dc = cp.zeros((scan_dimensions[0],scan_dimensions[1], frame_size, frame_size), dtype=cp.float32)
-
-    center_frame = cp.array(([frame_size // 2, frame_size // 2]))
-    fd = cp.array(frame_dimensions)
-    center = cp.array(center_data)
-
-    threadsperblock = (16, 16)
-    blockspergrid = tuple(np.ceil(np.array(indices.shape[:2]) / threadsperblock).astype(np.int))
-
-    sparse_to_dense_datacube_crop_gain_mask_kernel[blockspergrid, threadsperblock](dc, indices, counts, fd,
-        center_frame, center, radius_data_int, binning, fftshift)
-    return dc
-
-
-@cuda.jit
-def fftshift_kernel(indices, center_frame, scan_dimensions, no_count_indicator):
-    ny, nx = cuda.grid(2)
-    NY, NX = scan_dimensions
-    MY = center_frame[0] * 2
-    MX = center_frame[1] * 2
-    if ny < NY and nx < NX:
-        for i in range(indices[ny, nx].shape[0]):
-            idx1d = indices[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            mysh = (my - center_frame[0]) % (center_frame[0] * 2)
-            mxsh = (mx - center_frame[1]) % (center_frame[1] * 2)
-            if idx1d != no_count_indicator:
-                indices[ny, nx, i] = mysh * MX + mxsh
-
-
-@cuda.jit
-def fftshift_pad_kernel(indices, center_frame, scan_dimensions, new_frame_dimensions, no_count_indicator_old, no_count_indicator_new):
-    ny, nx = cuda.grid(2)
-    NY, NX = scan_dimensions
-    MX = center_frame[1] * 2
-    if ny < NY and nx < NX:
-        for i in range(indices[ny, nx].shape[0]):
-            idx1d = indices[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            mysh = (my - center_frame[0]) % (new_frame_dimensions[0])
-            mxsh = (mx - center_frame[1]) % (new_frame_dimensions[1])
-            if idx1d != no_count_indicator_old:
-                indices[ny, nx, i] = mysh * new_frame_dimensions[1] + mxsh
-            else:
-                indices[ny, nx, i] = no_count_indicator_new
-
-
-@cuda.jit
-def virtual_annular_image_kernel(img, indices, counts, radius_inner, radius_outer, center_frame, frame_dimensions, no_count_indicator):
-    ny, nx = cuda.grid(2)
-    NY, NX, _ = indices.shape
-    MY, MX = frame_dimensions
-    if ny < NY and nx < NX:
-        for i in range(indices[ny, nx].shape[0]):
-            idx1d = indices[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            my_center = my - center_frame[0]
-            mx_center = mx - center_frame[1]
-            radius = math.sqrt(my_center ** 2 + mx_center ** 2)
-            if radius < radius_outer and radius >= radius_inner and idx1d != no_count_indicator:
-                cuda.atomic.add(img, (ny,nx), counts[ny, nx, i])
-
-
-@cuda.jit
-def crop_symmetric_around_center_kernel(new_frames, old_frames, center_frame, old_frame_dimensions, center_data, radius_data_int):
-    ny, nx = cuda.grid(2)
-    NY, NX, _ = old_frames.shape
-    MY, MX = old_frame_dimensions
-    MXnew = center_frame[1] * 2
-    if ny < NY and nx < NX:
-        k = 0
-        for i in range(old_frames[ny, nx].shape[0]):
-            idx1d = old_frames[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            my_center = my - center_data[0]
-            mx_center = mx - center_data[1]
-            dist_center = math.sqrt(my_center ** 2 + mx_center ** 2)
-            if dist_center < radius_data_int:
-                mybin = int(center_frame[0] + my_center)
-                mxbin = int(center_frame[1] + mx_center)
-                new_frames[ny, nx, k] = mybin * MXnew + mxbin
-                k += 1
-
-
-def crop_symmetric_around_center(old_frames, old_frame_dimensions, center_data, max_radius):
-    max_radius_int = int(max_radius)
-    frame_size = 2 * max_radius_int
-    center_frame = cp.array([frame_size // 2, frame_size // 2])
-    new_frame_dimensions = np.array([frame_size,frame_size])
-
-    threadsperblock = (16, 16)
-    blockspergrid = tuple(np.ceil(np.array(old_frames.shape[:2]) / threadsperblock).astype(np.int))
-
-    new_frames = cp.zeros_like(old_frames)
-    new_frames[:] = cp.iinfo(new_frames.dtype).max
-
-    crop_symmetric_around_center_kernel[blockspergrid, threadsperblock](new_frames, old_frames, center_frame,
-                                                                        cp.array(old_frame_dimensions),
-                                                                        cp.array(center_data), max_radius_int)
-
-    max_counts = cp.max(cp.sum(new_frames > 0, 2).ravel())
-    res = cp.ascontiguousarray(new_frames[:,:,:max_counts])
-    return res, new_frame_dimensions
-
-
-@cuda.jit
-def rotate_kernel(frames, center_frame, old_frame_dimensions, center_data, no_count_indicator, angle_rad):
-    ny, nx = cuda.grid(2)
-    NY, NX, _ = frames.shape
-    MY, MX = old_frame_dimensions
-    MXnew = center_frame[1] * 2
-    if ny < NY and nx < NX:
-        for i in range(frames[ny, nx].shape[0]):
-            idx1d = frames[ny, nx, i]
-            if idx1d != no_count_indicator:
-                my = idx1d // MX
-                mx = idx1d - my * MX
-                my_center = my - center_data[0]
-                mx_center = mx - center_data[1]
-                #rotate
-                mx_center_rot = round(mx_center * math.cos(angle_rad) - my_center * math.sin(angle_rad))
-                my_center_rot = round(mx_center * math.sin(angle_rad) + my_center * math.cos(angle_rad))
-                mybin = int(center_frame[0] + my_center_rot)
-                mxbin = int(center_frame[1] + mx_center_rot)
-                frames[ny, nx, i] = mybin * MXnew + mxbin
-
-
-def rotate(frames, old_frame_dimensions, center, angle_rad):
-    threadsperblock = (16, 16)
-    blockspergrid = tuple(np.ceil(np.array(frames.shape[:2]) / threadsperblock).astype(np.int))
-    no_count_indicator = np.iinfo(frames.dtype).max
-    new_frames= cp.array(frames)
-    rotate_kernel[blockspergrid, threadsperblock](new_frames, center, cp.array(old_frame_dimensions), cp.array(center),
-                                                  no_count_indicator, angle_rad)
-
-    return new_frames.get()
-
-
-@cuda.jit
-def sum_kernel(indices, counts, frame_dimensions, sum, no_count_indicator):
-    ny, nx = cuda.grid(2)
-    NY, NX, _ = indices.shape
-    MY, MX = frame_dimensions
-    if ny < NY and nx < NX:
-        for i in range(indices[ny, nx].shape[0]):
-            idx1d = indices[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            if idx1d != no_count_indicator:
-                cuda.atomic.add(sum, (my, mx), counts[ny, nx, i])
-
-
-def sum_frames(frames, counts, frame_dimensions):
-    threadsperblock = (16, 16)
-    blockspergrid = tuple(np.ceil(np.array(frames.shape[:2]) / threadsperblock).astype(np.int))
-
-    sum = cp.zeros(frame_dimensions)
-    no_count_indicator = np.iinfo(frames.dtype).max
-    frames1 = cp.array(frames)
-    counts1 = cp.array(counts)
-    sum_kernel[blockspergrid, threadsperblock](frames1, counts1, cp.array(frame_dimensions), sum, no_count_indicator)
-    return sum.get()
-
-
-@cuda.jit
-def rebin_kernel(indices, counts, new_frame_center, old_indices, old_counts, old_frame_center, no_count_indicator,
-                 bin_factor):
-    ny, nx = cuda.grid(2)
-    NY, NX, _ = indices.shape
-    MY = old_frame_center[0] * 2
-    MX = old_frame_center[1] * 2
-    MXnew = new_frame_center[1] * 2
-    if ny < NY and nx < NX:
-        k = 0
-        for i in range(old_indices[ny, nx].shape[0]):
-            idx1d = old_indices[ny, nx, i]
-            my = idx1d // MX
-            mx = idx1d - my * MX
-            my_center = my - old_frame_center[0]
-            mx_center = mx - old_frame_center[1]
-            if idx1d != no_count_indicator:
-                mybin = int(new_frame_center[0] + my_center // bin_factor)
-                mxbin = int(new_frame_center[1] + mx_center // bin_factor)
-                indices[ny, nx, k] = mybin * MXnew + mxbin
-                counts[ny, nx, k] = old_counts[ny, nx, i]
-                k += 1
-
-
-def dense_to_sparse_kernel(dense, indices, counts, frame_dimensions):
-    ny, nx = cuda.grid(2)
-    NY, NX, MYBIN, MXBIN = dense.shape
-    MY, MX = frame_dimensions
-    if ny < NY and nx < NX:
-        k = 0
-        for mx in range(MX):
-            for my in range(MY):
-                idx1d = my * MX + mx
-                if dense[ny,nx,my,mx] > 0:
-                    indices[ny,nx,k] = idx1d
-                    counts[ny,nx,k] = dense[ny,nx,my,mx]
-                    k += 1
+        if nleft > 0:
+            fr_full_gpu.set(fr_full[-batch_size_dim0:])
+            sparse_to_dense_crop_bin_kernel[blockspergrid, threadsperblock](fr_full_gpu, max_frame_size, dc_gpu, 
+                                        mybin_range_gpu, mxbin_range_gpu, no_count_indicator, scan_dimensions[0]-batch_size_dim0, batch_size_dim0-nleft, batch_size_dim0)
+            cuda.synchronize()
+            print('partial batch of', nleft)
+    else:
+        fr_full_gpu = cp.array(fr_full)
+        threadsperblock = (32, 32)
+        blockspergrid = tuple(np.ceil(np.array(fr_full_gpu.shape[:2]) / threadsperblock).astype(int))
+        sparse_to_dense_crop_bin_kernel[blockspergrid, threadsperblock](fr_full_gpu, max_frame_size, dc_gpu, 
+                                        mybin_range_gpu, mxbin_range_gpu, no_count_indicator, 0, 0, scan_dimensions[0])
+        
+            
+    t2 = time.perf_counter()
+    print(f'cropping, binning took {t2-t1:.3f} sec')
+    return dc_gpu
