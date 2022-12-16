@@ -1,3 +1,4 @@
+
 # GPU-accelerated single side-band ptychography
 
 Python code to calculate a phase image from the bright field disk of atomic resolution 4D-STEM data using the single side-band method.
@@ -19,11 +20,17 @@ I built upon this foundation by reorganizing the code, rewriting the data pre-pr
 * Needs a Nvidia GPU and CUDA installed.
 ## Installation
 1. Install [cupy](https://docs.cupy.dev/en/stable/install.html).  The command you need to run likely depends on the version of CUDA you have, e.g.,
-    pip install cupy-cuda117
+````
+pip install cupy-cuda117
+````
 for CUDA v11.7.
 2. Install [ipywidgets](https://ipywidgets.readthedocs.io/en/stable/user_install.html).
 3. Install this package using pip.  Open a terminal in this folder, and run
-    pip install .
+````
+pip install .
+````
 or
-    pip install -e .
+````
+pip install -e .
+````
 This should automatically install this code as a Python package, along with all dependencies not already listed.
