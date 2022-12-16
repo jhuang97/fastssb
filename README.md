@@ -23,8 +23,8 @@ I built upon this foundation by reorganizing the code, rewriting the data pre-pr
 ````
 pip install cupy-cuda117
 ````
-for CUDA v11.7.
-2. Install [ipywidgets](https://ipywidgets.readthedocs.io/en/stable/user_install.html).
+for CUDA v11.7.  
+2. Install [ipywidgets](https://ipywidgets.readthedocs.io/en/stable/user_install.html).  
 3. Install this package using pip.  Open a terminal in this folder, and run
 ````
 pip install .
