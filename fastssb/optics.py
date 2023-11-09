@@ -73,7 +73,7 @@ def disk_overlap_function(Qx_all, Qy_all, Kx_all, Ky_all, aberrations, theta_rot
     gs = Gamma.shape
     threadsperblock = 2 ** 8
     blockspergrid = math.ceil(np.prod(gs) / threadsperblock)
-    strides = cp.array((np.array(Gamma.strides) / (Gamma.nbytes / Gamma.size)).astype(np.int))
+    strides = cp.array((np.array(Gamma.strides) / (Gamma.nbytes / Gamma.size)).astype(int))
     disk_overlap_kernel[blockspergrid, threadsperblock](Gamma, strides, Qx_all, Qy_all, Kx_all, Ky_all, aberrations,
                                                         theta_rot, alpha, lam)
     cp.cuda.Device().synchronize()
@@ -191,7 +191,7 @@ def single_sideband_reconstruction(G, Qx_all, Qy_all, Kx_all, Ky_all, aberration
                                    Ψ_Qp, Ψ_Qp_left_sb, Ψ_Qp_right_sb, eps, lam):
     threadsperblock = 2 ** 8
     blockspergrid = math.ceil(np.prod(G.shape) / threadsperblock)
-    strides = cp.array((np.array(G.strides) / (G.nbytes / G.size)).astype(np.int))
+    strides = cp.array((np.array(G.strides) / (G.nbytes / G.size)).astype(int))
     scale = 1
     single_sideband_kernel[blockspergrid, threadsperblock](G, strides, Qx_all, Qy_all, Kx_all, Ky_all, aberrations,
                                                            theta_rot, alpha_rad, Ψ_Qp, Ψ_Qp_left_sb,
